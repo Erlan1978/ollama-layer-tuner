@@ -72,7 +72,7 @@ How to use the result:
 | `--ctx` | 8192 | context length to tune for; a longer context needs more GPU memory, so the best value changes |
 | `--tokens` | 64 | tokens generated per measurement |
 | `--apply` | off | create a tuned copy of the model (the original is not changed) |
-| `--name` | `<model>-tuned` | name of the tuned copy |
+| `--name` | `<model>-<tag>-tuned`, e.g. `qwen3-4b-instruct-tuned` (`-32k-tuned` for `--ctx 32768`) | name of the tuned copy |
 | `--out` | `results.json` | file where results are appended |
 
 ## How it works

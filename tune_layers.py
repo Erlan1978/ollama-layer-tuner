@@ -146,6 +146,13 @@ def apply(ol, model, ng, ctx, name, log):
     log(f"Created model '{name}' (Modelfile: {path})" if r.returncode == 0 else "ollama create failed: " + r.stderr[-300:])
 
 
+def default_name(model, ctx):
+    """qwen3:4b-instruct -> qwen3-4b-instruct-tuned; other context lengths get their own copy (-32k-tuned)."""
+    base = re.sub(r":latest$", "", model.split("/")[-1])
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-")
+    return base + ("" if ctx == 8192 else f"-{ctx // 1024}k") + "-tuned"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Find the fastest num_gpu for an Ollama model on this machine.")
     ap.add_argument("model", nargs="?", help="model name; omit to choose from a list")
@@ -154,7 +161,7 @@ def main():
     ap.add_argument("--ctx", type=int, default=8192, help="context length you will actually use (affects GPU memory)")
     ap.add_argument("--tokens", type=int, default=64, help="tokens generated per measurement")
     ap.add_argument("--apply", action="store_true", help="create a tuned copy of the model with the best num_gpu")
-    ap.add_argument("--name", help="name for the tuned copy (default: <model>-tuned)")
+    ap.add_argument("--name", help="name for the tuned copy (default: <model>-<tag>-tuned)")
     ap.add_argument("--out", default="results.json", help="JSON file to append results to")
     a = ap.parse_args()
     if not a.host.startswith("http"):
@@ -167,6 +174,8 @@ def main():
         sys.exit(f"Ollama is not reachable at {a.host}: {e}")
     model = a.model
     if not model:
+        if not names:
+            sys.exit(f"No models on {a.host}. Pull one first, e.g.: ollama pull llama3.2:3b")
         for i, n in enumerate(names, 1):
             print(f"  {i:2}. {n}")
         while not model:
@@ -189,6 +198,9 @@ def main():
     try:
         allres = json.loads(out.read_text(encoding="utf-8")) if out.exists() else []
     except ValueError:
+        backup = out.with_suffix(".broken.json")
+        out.replace(backup)
+        log(f"Warning: {out} was not valid JSON; it was kept as {backup} and a new file was started.")
         allres = []
     allres = [x for x in allres if not (x.get("model") == model and x.get("ctx") == a.ctx)] + [r]
     tmp = out.with_suffix(".tmp")
@@ -196,7 +208,7 @@ def main():
     tmp.replace(out)
 
     if a.apply:
-        apply(ol, model, r["best_num_gpu"], a.ctx, a.name or model.split("/")[-1].split(":")[0] + "-tuned", log)
+        apply(ol, model, r["best_num_gpu"], a.ctx, a.name or default_name(model, a.ctx), log)
 
 
 if __name__ == "__main__":
