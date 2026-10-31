@@ -7,7 +7,8 @@ On small GPUs (4–8 GB) Ollama's automatic choice can be several times slower t
 On a GTX 1650 SUPER (4 GB) the tuned setting was **1.4× to 6.8× faster** than Ollama's default for every model
 tested below.
 
-One file, Python standard library only, works with any Ollama server.
+One script, Python standard library only, works with any Ollama server.
+An independent tool, not affiliated with Ollama Inc.
 
 ## Results
 
@@ -21,14 +22,19 @@ the raw data is in [`results/bench.json`](results/bench.json) and the full log i
 | gemma3:4b | 34 | 8192 | 9.7 | 35 | 54.4 | **×5.6** |
 | qwen3:4b-instruct | 36 | 32768 | 7.1 | 37 | 48.3 | **×6.8** |
 | qwen2.5:7b-instruct | 28 | 8192 | 5.2 | 25 | 15.3 | **×2.9** |
-| Qwen3.5-9B Q4_K_M (community fine-tune) | 32 | 8192 | 4.0 | 23 | 7.6 | **×1.9** |
-| Qwen3-14B Q4_K_M (community fine-tune) | 40 | 8192 | 2.1 | 21 | 2.9 | **×1.4** |
+| Qwen3.5-9B Q4_K_M (community GGUF) | 32 | 8192 | 4.0 | 23 | 7.6 | **×1.9** |
+| Qwen3-14B Q4_K_M (community GGUF) | 40 | 8192 | 2.1 | 21 | 2.9 | **×1.4** |
+
+The table was measured with the first version of the script, where "best" was the average of the sweep run and
+one repeat, and Ollama auto was measured once. The sweep winner's first run is a little too high (it is the best
+of many noisy runs), so these speed-ups are slightly optimistic, by up to about 5%. Since then only repeat runs
+are compared and Ollama auto is measured twice. That changes the decimals, not the conclusions.
 
 Test machine: NVIDIA GTX 1650 SUPER 4 GB (driver 610.88), Intel i5-12400F, 16 GB DDR4 (one stick, 2400 MT/s),
 Windows 11, Ollama 0.40.11. 64 generated tokens per measurement, temperature 0.
 
 What the numbers show on this machine:
-- Ollama's automatic choice put only about **2.1 GB** of every model on the 4 GB card, however small the model was.
+- Ollama's automatic choice put only **1.4–2.1 GB** of each model on the 4 GB card, however small the model was.
 - Small models (3–4B) run several times faster when **all** layers go to the GPU.
 - For 7B–14B models the best point is in the middle: too few layers wastes the GPU, too many slows things down again.
   That point is different for every model and context length, which is why it is worth measuring.
@@ -68,19 +74,22 @@ How to use the result:
 | Option | Default | Meaning |
 |---|---|---|
 | `model` | list to choose from | model name as in `ollama list` |
-| `--host` | `$OLLAMA_HOST` or `http://127.0.0.1:11434` | Ollama server |
+| `--host` | `$OLLAMA_HOST` or `127.0.0.1:11434` | Ollama server; read like the `ollama` command does (`0.0.0.0` means this machine, no port means 11434) |
 | `--ctx` | 8192 | context length to tune for; a longer context needs more GPU memory, so the best value changes |
 | `--tokens` | 64 | tokens generated per measurement |
 | `--apply` | off | create a tuned copy of the model (the original is not changed) |
 | `--name` | `<model>-<tag>-tuned`, e.g. `qwen3-4b-instruct-tuned` (`-32k-tuned` for `--ctx 32768`) | name of the tuned copy |
-| `--out` | `results.json` | file where results are appended |
+| `--out` | `results.json` | results file; a new run of the same model and context replaces the old entry |
 
 ## How it works
 
 1. Reads the number of layers from `/api/show`.
 2. Measures Ollama's automatic choice (`num_gpu = -1`).
 3. Coarse sweep from 0 to all layers in about 6 steps, then halves the step around the best point down to 1.
-4. Re-measures the two best settings and averages them: single runs differ by up to ~5%.
+4. Runs the two best settings and Ollama auto once more and compares only those repeat runs. Single runs differ
+   by up to ~5%, and the sweep winner's first number is the best of many noisy runs, so it is too high.
+   A setting that does not load on the repeat run is dropped: it is too close to the memory limit.
+   Press Ctrl+C at any time to stop; the best value so far is printed.
 5. Every measurement loads the model from scratch, generates a short answer and unloads it. Only the generation
    speed (`eval_duration`) is timed; loading and prompt reading are not.
 
@@ -90,7 +99,7 @@ Tuning takes about 2 minutes for a 3B model and 15–30 minutes for 14B+ models,
 
 - **Close other GPU programs and other loaded models during tuning**, or the numbers will be wrong. The script unloads
   models on the server it tunes, but not on other Ollama servers.
-- **"GPU memory" can exceed the card's VRAM on Windows.** In the table above, some best settings report 4–7 GB on a
+- **"GPU memory" can exceed the card's VRAM on Windows.** In `results/bench.json` some best settings report 4–7 GB on a
   4 GB card. The NVIDIA driver on Windows can spill GPU memory into system RAM ("sysmem fallback"), and Ollama counts
   that as GPU memory. It was still the fastest setting in these tests. On Linux, or with sysmem fallback disabled,
   such settings simply fail to load and the script skips them.
@@ -103,4 +112,8 @@ Tuning takes about 2 minutes for a 3B model and 15–30 minutes for 14B+ models,
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+Not affiliated with, endorsed by, or sponsored by Ollama Inc. "Ollama" is a trademark of its owner and is used here
+only to describe compatibility. Model names are used only to say what was measured; no model weights are included
+in this repository.

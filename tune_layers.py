@@ -9,7 +9,8 @@ fastest setting, in either direction. This script measures it instead of guessin
   1. reads the layer count of the model,
   2. measures generation speed with Ollama's automatic choice (num_gpu = -1),
   3. coarse sweep from 0 to all layers, then a finer search around the best point,
-  4. re-measures the two best settings and averages them (single runs are noisy by ~5%),
+  4. runs the two best settings and Ollama auto once more and compares only those repeat runs
+     (the sweep winner's first number is too high: it is the best of many noisy runs),
   5. prints the result and, with --apply, creates a tuned copy of the model.
 
 Only the Python standard library is used. Every measurement loads the model from scratch, so other models are
@@ -31,7 +32,36 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+DEFAULT_CTX = 8192
 PROMPT = "Explain in simple words why the sky is blue. Write 5-6 sentences."
+
+
+def normalize_host(h):
+    """Read OLLAMA_HOST the way the ollama CLI does: '0.0.0.0', ':11434', 'pc', 'pc:11434', 'https://pc'.
+
+    0.0.0.0 and :: mean "listen on every interface" (the Ollama FAQ recommends it for LAN access) and cannot be
+    connected to, so the local address is used. localhost becomes 127.0.0.1: on Windows 'localhost' tries IPv6
+    first and adds ~2 s to every request. Without a port: 11434, or 80/443 when the scheme is given (as Ollama does).
+    """
+    h = (h or "").strip()
+    scheme, port = "http", "11434"
+    if "://" in h:
+        scheme, h = h.split("://", 1)
+        port = {"http": "80", "https": "443"}.get(scheme, port)
+    h = h.split("/", 1)[0]
+    if h.startswith("["):                                   # [::1]:11434
+        host, _, rest = h[1:].partition("]")
+        port = rest.lstrip(":") or port
+    elif h.count(":") > 1:                                  # bare IPv6 address
+        host = h
+    else:
+        host, _, p = h.partition(":")
+        port = p or port
+    if host in ("", "0.0.0.0", "::", "localhost"):
+        host = "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
 
 
 class Ollama:
@@ -44,18 +74,33 @@ class Ollama:
         return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
     def cli(self, *args):
-        env = {**os.environ, "OLLAMA_HOST": self.host.replace("http://", "")}
-        return subprocess.run(["ollama", *args], env=env, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace")
+        env = {**os.environ, "OLLAMA_HOST": self.host}
+        try:
+            return subprocess.run(["ollama", *args], env=env, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return subprocess.CompletedProcess(args, 1, "", "the 'ollama' command is not installed on this machine")
+
+    def unload(self, model):
+        try:
+            self.call("/api/generate", {"model": model, "keep_alive": 0}, timeout=120)
+        except OSError:
+            pass
 
     def unload_all(self):
         for m in self.call("/api/ps").get("models", []):
-            self.call("/api/generate", {"model": m["name"], "keep_alive": 0})
+            self.unload(m["name"])
+
+    def is_local(self):
+        return any(x in self.host for x in ("://127.", "://[::1]"))
 
 
 def layer_count(ol, model):
     info = ol.call("/api/show", {"model": model}).get("model_info", {})
-    n = next((v for k, v in info.items() if k.endswith(".block_count")), None)
+    arch = info.get("general.architecture")
+    n = info.get(f"{arch}.block_count") if arch else None
+    if n is None:      # vision models also have "<arch>.vision.block_count"; that is not the number we need
+        n = next((v for k, v in info.items() if k.endswith(".block_count") and ".vision." not in k), None)
     return int(n) if n else None
 
 
@@ -85,21 +130,18 @@ def measure(ol, model, ng, ctx, tokens, log):
         log(f"  num_gpu {label:>4}  {res['tok_s']:7.2f} tok/s   GPU memory {res['vram_gb']:.2f} GB")
     except (urllib.error.URLError, OSError, KeyError, ZeroDivisionError, ValueError) as e:
         log(f"  num_gpu {label:>4}  failed (does not fit?): {str(e)[:90]}")
-    try:
-        ol.call("/api/generate", {"model": model, "keep_alive": 0})   # next measurement starts from a clean GPU
-    except OSError:
-        pass
+    ol.unload(model)                                   # next measurement starts from a clean GPU
     time.sleep(2)
     return res
 
 
-def tune(ol, model, ctx, tokens, log):
+def tune(ol, model, ctx, tokens, log, res):
+    """res: dict num_gpu -> first measurement, filled as we go (the caller keeps it if the run is interrupted)."""
     total = layer_count(ol, model)
     if not total:
         sys.exit(f"Cannot read the layer count of {model}")
     top = total + 1                                    # +1: the output layer is offloaded as well
     log(f"\n{model}: {total} layers, context {ctx}, {tokens} tokens per test")
-    res = {}
 
     def m(ng):
         if ng not in res:
@@ -120,15 +162,29 @@ def tune(ol, model, ctx, tokens, log):
     ranked = sorted(ok(), key=lambda k: -res[k]["tok_s"])
     if not ranked:
         sys.exit("No setting could be loaded")
-    log("  re-measuring the two best settings:")
-    final = {}
-    for ng in ranked[:2]:
+
+    # The sweep winner is the maximum of many noisy runs, so its first number is too high ("winner's curse").
+    # Only repeat runs are compared, and Ollama auto is repeated too, so both sides are measured the same way.
+    # A setting that does not load a second time is too close to the memory limit to recommend.
+    log("  repeat runs (only these are compared):")
+    repeat = {}
+    for ng in ranked[:4]:
+        if len(repeat) == 2:
+            break
         again = measure(ol, model, ng, ctx, tokens, log)
-        final[ng] = (res[ng]["tok_s"] + again["tok_s"]) / 2 if again else res[ng]["tok_s"]
-    best = max(final, key=final.get)
-    auto = res[-1]["tok_s"] if res.get(-1) else None
-    return {"model": model, "layers": total, "ctx": ctx, "best_num_gpu": best, "best_tok_s": round(final[best], 2),
-            "auto_tok_s": auto and round(auto, 2), "speedup": auto and round(final[best] / auto, 2),
+        if again:
+            repeat[ng] = again["tok_s"]
+        else:
+            log(f"  num_gpu {ng} did not load on the repeat run - skipped as unreliable")
+    if not repeat:
+        sys.exit("None of the best settings loaded a second time: the GPU is too close to full")
+    best = max(repeat, key=repeat.get)
+    auto_runs = [v["tok_s"] for v in (res.get(-1), measure(ol, model, -1, ctx, tokens, log)) if v]
+    auto = sum(auto_runs) / len(auto_runs) if auto_runs else None
+    return {"model": model, "layers": total, "ctx": ctx, "best_num_gpu": best, "best_tok_s": round(repeat[best], 2),
+            "auto_tok_s": auto and round(auto, 2), "speedup": auto and round(repeat[best] / auto, 2),
+            "repeat": {str(k): round(v, 2) for k, v in repeat.items()},
+            "auto_runs": [round(v, 2) for v in auto_runs],
             "sweep": {("auto" if k == -1 else str(k)): v and {kk: round(vv, 2) for kk, vv in v.items()}
                       for k, v in sorted(res.items())}}
 
@@ -150,58 +206,96 @@ def default_name(model, ctx):
     """qwen3:4b-instruct -> qwen3-4b-instruct-tuned; other context lengths get their own copy (-32k-tuned)."""
     base = re.sub(r":latest$", "", model.split("/")[-1])
     base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-")
-    return base + ("" if ctx == 8192 else f"-{ctx // 1024}k") + "-tuned"
+    if ctx != DEFAULT_CTX:
+        base += f"-{ctx // 1024}k" if ctx % 1024 == 0 else f"-{ctx}"
+    return base + "-tuned"
+
+
+def load_results(out, log):
+    """Existing results, or [] - a file that is not a JSON list is moved aside, never silently overwritten."""
+    if not out.exists():
+        return []
+    try:
+        data = json.loads(out.read_text(encoding="utf-8-sig"))
+        if isinstance(data, list) and all(isinstance(x, dict) for x in data):
+            return data
+    except ValueError:
+        pass
+    backup = out.with_name(f"{out.stem}.broken-{time.strftime('%Y%m%d-%H%M%S')}.json")
+    out.replace(backup)
+    log(f"Warning: {out} is not a results list; it was kept as {backup} and a new file will be started.")
+    return []
 
 
 def main():
     ap = argparse.ArgumentParser(description="Find the fastest num_gpu for an Ollama model on this machine.")
     ap.add_argument("model", nargs="?", help="model name; omit to choose from a list")
-    ap.add_argument("--host", default=os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"),
-                    help="Ollama server (default: $OLLAMA_HOST or http://127.0.0.1:11434)")
-    ap.add_argument("--ctx", type=int, default=8192, help="context length you will actually use (affects GPU memory)")
+    ap.add_argument("--host", default=os.environ.get("OLLAMA_HOST", "127.0.0.1:11434"),
+                    help="Ollama server (default: $OLLAMA_HOST or 127.0.0.1:11434)")
+    ap.add_argument("--ctx", type=int, default=DEFAULT_CTX,
+                    help="context length you will actually use (affects GPU memory)")
     ap.add_argument("--tokens", type=int, default=64, help="tokens generated per measurement")
     ap.add_argument("--apply", action="store_true", help="create a tuned copy of the model with the best num_gpu")
     ap.add_argument("--name", help="name for the tuned copy (default: <model>-<tag>-tuned)")
-    ap.add_argument("--out", default="results.json", help="JSON file to append results to")
+    ap.add_argument("--out", default="results.json",
+                    help="JSON file with results (a new run of the same model and context replaces the old one)")
     a = ap.parse_args()
-    if not a.host.startswith("http"):
-        a.host = "http://" + a.host
-
-    ol = Ollama(a.host)
-    try:
-        names = sorted(m["name"] for m in ol.call("/api/tags")["models"])
-    except OSError as e:
-        sys.exit(f"Ollama is not reachable at {a.host}: {e}")
-    model = a.model
-    if not model:
-        if not names:
-            sys.exit(f"No models on {a.host}. Pull one first, e.g.: ollama pull llama3.2:3b")
-        for i, n in enumerate(names, 1):
-            print(f"  {i:2}. {n}")
-        while not model:
-            s = input("Model number: ").strip()
-            if s.isdigit() and 1 <= int(s) <= len(names):
-                model = names[int(s) - 1]
+    if a.ctx < 256 or a.tokens < 8:
+        sys.exit("--ctx must be at least 256 and --tokens at least 8")
+    a.host = normalize_host(a.host)
 
     def log(s):
         print(s, flush=True)
 
+    ol = Ollama(a.host)
+    try:
+        names = sorted(m["name"] for m in ol.call("/api/tags", timeout=15)["models"])
+    except (OSError, ValueError, KeyError) as e:
+        sys.exit(f"Ollama is not reachable at {a.host}: {e}")
+    if not names:
+        sys.exit(f"No models on {a.host}. Pull one first, e.g.: ollama pull llama3.2:3b")
+    model = a.model
+    if model and model not in names and model + ":latest" not in names:
+        similar = [n for n in names if n.split(":")[0] == model.split(":")[0]]
+        sys.exit(f"Model '{model}' is not on {a.host}."
+                 + (f" Installed: {', '.join(similar)}." if similar else "")
+                 + f" To download it: ollama pull {model}")
+    if not model:
+        for i, n in enumerate(names, 1):
+            print(f"  {i:2}. {n}")
+        while not model:
+            try:
+                s = input("Model number: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit("\nNo model chosen")
+            try:
+                model = names[int(s) - 1] if 1 <= int(s) <= len(names) else None
+            except ValueError:
+                pass
+
+    out = Path(a.out)                       # checked before tuning, so a long run is never lost at the end
+    out.parent.mkdir(parents=True, exist_ok=True)
+    allres = load_results(out, log)
+
     ol.unload_all()
-    r = tune(ol, model, a.ctx, a.tokens, log)
-    r.update({"date": time.strftime("%Y-%m-%d"), "gpu": gpu_name()})
+    res = {}
+    try:
+        r = tune(ol, model, a.ctx, a.tokens, log, res)
+    except KeyboardInterrupt:
+        ol.unload(model)
+        done = {k: v["tok_s"] for k, v in res.items() if k >= 0 and v}
+        if done:
+            b = max(done, key=done.get)
+            log(f"\nStopped. Best so far (one run, not confirmed): num_gpu {b} -> {done[b]:.2f} tok/s. Nothing saved.")
+        else:
+            log("\nStopped. Nothing saved.")
+        sys.exit(130)
+    r.update({"date": time.strftime("%Y-%m-%d"), "gpu": gpu_name() if ol.is_local() else None})
     log(f"\nBEST: num_gpu {r['best_num_gpu']} -> {r['best_tok_s']} tok/s"
         + (f"   (Ollama auto: {r['auto_tok_s']} tok/s, x{r['speedup']})" if r["auto_tok_s"] else ""))
     log(f"To use it: add 'PARAMETER num_gpu {r['best_num_gpu']}' to the Modelfile, "
         f"or pass options {{\"num_gpu\": {r['best_num_gpu']}}} in API calls.")
 
-    out = Path(a.out)
-    try:
-        allres = json.loads(out.read_text(encoding="utf-8")) if out.exists() else []
-    except ValueError:
-        backup = out.with_suffix(".broken.json")
-        out.replace(backup)
-        log(f"Warning: {out} was not valid JSON; it was kept as {backup} and a new file was started.")
-        allres = []
     allres = [x for x in allres if not (x.get("model") == model and x.get("ctx") == a.ctx)] + [r]
     tmp = out.with_suffix(".tmp")
     tmp.write_text(json.dumps(allres, indent=1), encoding="utf-8")

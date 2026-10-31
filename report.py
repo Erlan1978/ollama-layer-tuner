@@ -5,8 +5,8 @@ import json
 import sys
 
 LABELS = {  # local names of fine-tunes used in the benchmark -> what they are
-    "unc9b": "Qwen3.5-9B Q4_K_M (HauhauCS fine-tune)",
-    "unc14b": "Qwen3-14B Q4_K_M (Huihui fine-tune)",
+    "unc9b": "Qwen3.5-9B Q4_K_M (community GGUF)",
+    "unc14b": "Qwen3-14B Q4_K_M (community GGUF)",
 }
 
 
